@@ -1,0 +1,25 @@
+/**:
+  ros__parameters:
+    image_topic: /camera/image_raw
+    set_camera_info_service: /camera/set_camera_info
+    camera_name: camera
+
+    # chessboard, circles, or acircles. Rows and columns count detected points.
+    board.pattern: circles
+    board.columns: 7
+    board.rows: 7
+    board.square_size_m: 0.03
+
+    sampling.auto_start: true
+    sampling.processing_rate_hz: 15.0
+    sampling.minimum_samples: 12
+    sampling.maximum_samples: 40
+    sampling.minimum_sample_distance: 0.12
+
+    calibration.fix_principal_point: false
+    calibration.fix_aspect_ratio: false
+    calibration.zero_tangent_distortion: false
+
+    display.preview_scale: 0.6
+    display.jpeg_quality: 80
+    output_path: /tmp/mono_camera.yaml
