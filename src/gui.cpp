@@ -7,6 +7,7 @@
 #include <std_srvs/srv/trigger.hpp>
 
 #include <chrono>
+#include <cctype>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -113,7 +114,8 @@ int main(int argc, char ** argv)
   while (rclcpp::ok()) {
     rclcpp::spin_some(node);
     cv::imshow(window, node->displayImage());
-    const int key = cv::waitKey(10) & 0xff;
+    const int key = std::tolower(
+      static_cast<unsigned char>(cv::waitKey(10) & 0xff));
     if (key == 'q' || key == 27) {
       break;
     }
