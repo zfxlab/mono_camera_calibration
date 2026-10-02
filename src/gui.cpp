@@ -58,11 +58,19 @@ public:
   {
     std::lock_guard<std::mutex> lock(mutex_);
     cv::Mat display = image_.empty() ? cv::Mat::zeros(480, 800, CV_8UC3) : image_.clone();
-    const std::string details = "state=" + status_ + "  received=" + value("received_frames") +
-      "  processed=" + value("processed_frames") + "  RMS=" + value("rms_error_px");
-    cv::rectangle(display, {0, display.rows - 58}, {display.cols, display.rows}, {24, 24, 24}, cv::FILLED);
-    cv::putText(display, details, {12, display.rows - 33}, cv::FONT_HERSHEY_SIMPLEX,
-      0.48, {220, 220, 220}, 1, cv::LINE_AA);
+    const std::string details = "state=" + status_ + "  capture=" + value("capturing") +
+      "  samples=" + value("accepted_samples") + "/" + value("minimum_samples") +
+      "  RMS=" + value("rms_error_px");
+    cv::rectangle(
+      display, {0, display.rows - 102}, {display.cols, display.rows}, {24, 24, 24}, cv::FILLED);
+    cv::putText(display, details, {12, display.rows - 76}, cv::FONT_HERSHEY_SIMPLEX,
+      0.46, {220, 220, 220}, 1, cv::LINE_AA);
+    cv::putText(
+      display, "decision=" + value("last_decision"), {12, display.rows - 54},
+      cv::FONT_HERSHEY_SIMPLEX, 0.43, {190, 210, 220}, 1, cv::LINE_AA);
+    cv::putText(
+      display, "action=" + action_status_, {12, display.rows - 32},
+      cv::FONT_HERSHEY_SIMPLEX, 0.43, {170, 230, 170}, 1, cv::LINE_AA);
     cv::putText(display, "G start | X stop | R reset | C calibrate | S save | U commit | Q quit",
       {12, display.rows - 10}, cv::FONT_HERSHEY_SIMPLEX, 0.45, {170, 210, 255}, 1, cv::LINE_AA);
     return display;
@@ -72,13 +80,16 @@ public:
   {
     const auto iterator = clients_.find(name);
     if (iterator == clients_.end() || !iterator->second->service_is_ready()) {
+      setActionStatus(name + ": service not ready");
       RCLCPP_WARN(get_logger(), "service '%s' is not ready", name.c_str());
       return;
     }
+    setActionStatus(name + ": request sent");
     iterator->second->async_send_request(
       std::make_shared<std_srvs::srv::Trigger::Request>(),
       [this, name](rclcpp::Client<std_srvs::srv::Trigger>::SharedFuture future) {
         const auto response = future.get();
+        setActionStatus(name + ": " + response->message);
         if (response->success) {
           RCLCPP_INFO(get_logger(), "%s: %s", name.c_str(), response->message.c_str());
         } else {
@@ -88,6 +99,12 @@ public:
   }
 
 private:
+  void setActionStatus(const std::string & status)
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    action_status_ = status;
+  }
+
   std::string value(const std::string & key) const
   {
     const auto iterator = values_.find(key);
@@ -97,6 +114,7 @@ private:
   std::mutex mutex_;
   cv::Mat image_;
   std::string status_{"WAITING"};
+  std::string action_status_{"ready"};
   std::map<std::string, std::string> values_;
   std::map<std::string, rclcpp::Client<std_srvs::srv::Trigger>::SharedPtr> clients_;
   rclcpp::Subscription<sensor_msgs::msg::CompressedImage>::SharedPtr preview_subscription_;

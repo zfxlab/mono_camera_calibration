@@ -88,18 +88,32 @@ ComposableNode(
 | `sampling.processing_rate_hz` | 标定板检测频率 |
 | `sampling.minimum_samples` | 允许求解的最少样本数 |
 | `sampling.maximum_samples` | 最大样本数 |
-| `sampling.minimum_sample_distance` | 自动采样的最小姿态差异 |
+| `sampling.minimum_sample_distance` | 两个样本全部归一化检测点之间的最小 RMS 距离 |
+| `sampling.minimum_board_coverage` | 标定板包围框占图像面积的最小比例 |
+| `sampling.minimum_edge_margin` | 标定板与图像边缘之间的最小归一化距离 |
+| `sampling.minimum_sharpness` | 标定板区域允许的最小拉普拉斯方差 |
+| `sampling.maximum_dark_ratio` | 标定板区域暗像素比例上限 |
+| `sampling.maximum_bright_ratio` | 标定板区域亮像素比例上限 |
+| `calibration.fix_k3` | 固定第三径向畸变系数，降低窄视场参数耦合 |
+| `calibration.outlier_minimum_error_px` | 异常视图重投影误差阈值下限 |
+| `calibration.outlier_mad_scale` | 基于 MAD 的异常视图阈值倍数 |
+| `calibration.minimum_pose_tilt_degrees` | 姿态覆盖检查采用的最小板面倾角 |
+| `calibration.minimum_tilted_samples_per_direction` | 左、右、上、下各方向至少需要的倾斜样本数 |
 | `display.preview_scale` | 压缩预览缩放比例 |
 | `display.jpeg_quality` | JPEG 预览质量 |
 | `output_path` | Save 操作写入的 YAML 路径 |
 
-`board.columns` 和 `board.rows` 表示检测点数量，而不是方格数量。
+`board.columns` 和 `board.rows` 表示检测点数量，而不是方格数量。求解会先计算每个视图的
+重投影误差，再使用 `median + mad_scale × 1.4826 × MAD` 检出异常视图并重新求解，同时保证
+不少于 `sampling.minimum_samples` 个样本。离群点剔除后，求解还会检查标定板法向在左、右、
+上、下四个方向的倾斜覆盖；任一方向不足时标定失败，并提示四个方向实际满足条件的样本数。
+按 `S` 保存的 YAML 会包含整体误差、逐视图误差以及使用和剔除的样本数。
 
 ## GUI 按键
 
 - `G`：开始采集样本
 - `X`：停止采集样本
-- `R`：清空样本和标定结果
+- `R`：清空样本和标定结果，并暂停采样
 - `C`：执行标定求解
 - `S`：将结果保存到 `output_path`
 - `U`：通过 `set_camera_info_service` 提交结果

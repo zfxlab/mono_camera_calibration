@@ -16,6 +16,7 @@
 #include <sensor_msgs/srv/set_camera_info.hpp>
 #include <std_srvs/srv/trigger.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -76,11 +77,17 @@ public:
     pattern_ = declare_parameter<std::string>("board.pattern", "circles");
     const double square_size = declare_parameter<double>("board.square_size_m", 0.03);
     minimum_samples_ = static_cast<std::size_t>(
-      declare_parameter<int>("sampling.minimum_samples", 12));
+      declare_parameter<int>("sampling.minimum_samples", 20));
     const int maximum_samples = declare_parameter<int>("sampling.maximum_samples", 40);
     const double minimum_sample_distance =
-      declare_parameter<double>("sampling.minimum_sample_distance", 0.12);
-    capturing_ = declare_parameter<bool>("sampling.auto_start", true);
+      declare_parameter<double>("sampling.minimum_sample_distance", 0.025);
+    minimum_board_coverage_ =
+      declare_parameter<double>("sampling.minimum_board_coverage", 0.01);
+    minimum_edge_margin_ = declare_parameter<double>("sampling.minimum_edge_margin", 0.005);
+    minimum_sharpness_ = declare_parameter<double>("sampling.minimum_sharpness", 15.0);
+    maximum_dark_ratio_ = declare_parameter<double>("sampling.maximum_dark_ratio", 0.50);
+    maximum_bright_ratio_ = declare_parameter<double>("sampling.maximum_bright_ratio", 0.20);
+    capturing_ = declare_parameter<bool>("sampling.auto_start", false);
     const double processing_rate = declare_parameter<double>("sampling.processing_rate_hz", 15.0);
     preview_scale_ = declare_parameter<double>("display.preview_scale", 0.6);
     jpeg_quality_ = declare_parameter<int>("display.jpeg_quality", 80);
@@ -96,7 +103,11 @@ public:
     }
     if (minimum_samples_ < 3 || maximum_samples < static_cast<int>(minimum_samples_) ||
       !(processing_rate > 0.0) || !(preview_scale_ > 0.0) || preview_scale_ > 1.0 ||
-      jpeg_quality_ < 1 || jpeg_quality_ > 100)
+      jpeg_quality_ < 1 || jpeg_quality_ > 100 || !(minimum_board_coverage_ >= 0.0) ||
+      minimum_board_coverage_ > 1.0 || !(minimum_edge_margin_ >= 0.0) ||
+      minimum_edge_margin_ >= 0.5 || !(minimum_sharpness_ >= 0.0) ||
+      !(maximum_dark_ratio_ >= 0.0) || maximum_dark_ratio_ > 1.0 ||
+      !(maximum_bright_ratio_ >= 0.0) || maximum_bright_ratio_ > 1.0)
     {
       throw std::invalid_argument("invalid sampling or display parameters");
     }
@@ -104,8 +115,23 @@ public:
     CalibrationOptions calibration_options;
     calibration_options.board_size = {board_columns, board_rows};
     calibration_options.square_size_m = square_size;
+    calibration_options.minimum_samples = minimum_samples_;
     calibration_options.maximum_samples = static_cast<std::size_t>(maximum_samples);
     calibration_options.minimum_sample_distance = minimum_sample_distance;
+    calibration_options.outlier_minimum_error_px =
+      declare_parameter<double>("calibration.outlier_minimum_error_px", 0.15);
+    calibration_options.outlier_mad_scale =
+      declare_parameter<double>("calibration.outlier_mad_scale", 3.0);
+    calibration_options.minimum_pose_tilt_degrees =
+      declare_parameter<double>("calibration.minimum_pose_tilt_degrees", 10.0);
+    const int minimum_tilted_samples_per_direction =
+      declare_parameter<int>("calibration.minimum_tilted_samples_per_direction", 1);
+    if (minimum_tilted_samples_per_direction < 1) {
+      throw std::invalid_argument(
+              "calibration.minimum_tilted_samples_per_direction must be positive");
+    }
+    calibration_options.minimum_tilted_samples_per_direction =
+      static_cast<std::size_t>(minimum_tilted_samples_per_direction);
     calibration_options.asymmetric_grid = pattern_ == "acircles";
     if (declare_parameter<bool>("calibration.fix_principal_point", false)) {
       calibration_options.calibration_flags |= cv::CALIB_FIX_PRINCIPAL_POINT;
@@ -115,6 +141,9 @@ public:
     }
     if (declare_parameter<bool>("calibration.fix_aspect_ratio", false)) {
       calibration_options.calibration_flags |= cv::CALIB_FIX_ASPECT_RATIO;
+    }
+    if (declare_parameter<bool>("calibration.fix_k3", true)) {
+      calibration_options.calibration_flags |= cv::CALIB_FIX_K3;
     }
     calibrator_ = std::make_unique<MonoCalibrator>(calibration_options);
     state_ = capturing_ ? "WAITING_FOR_BOARD" : "PREVIEW_ONLY";
@@ -138,52 +167,55 @@ public:
       std::chrono::milliseconds(200), std::bind(&MonoCalibrationNode::publishStatus, this));
 
     start_service_ = createTriggerService("start", [this](std::string & message) {
-      std::lock_guard<std::mutex> lock(mutex_);
-      capturing_ = true;
-      state_ = "WAITING_FOR_BOARD";
-      message = "sample capture started";
-      return true;
+          std::lock_guard<std::mutex> lock(mutex_);
+          capturing_ = true;
+          state_ = "WAITING_FOR_BOARD";
+          message = "sample capture started";
+          return true;
     });
     stop_service_ = createTriggerService("stop", [this](std::string & message) {
-      std::lock_guard<std::mutex> lock(mutex_);
-      capturing_ = false;
-      state_ = "PREVIEW_ONLY";
-      message = "sample capture stopped";
-      return true;
+          std::lock_guard<std::mutex> lock(mutex_);
+          capturing_ = false;
+          state_ = "PREVIEW_ONLY";
+          message = "sample capture stopped";
+          return true;
     });
     reset_service_ = createTriggerService("reset", [this](std::string & message) {
-      std::lock_guard<std::mutex> lock(mutex_);
-      calibrator_->clear();
-      result_ = {};
-      state_ = capturing_ ? "WAITING_FOR_BOARD" : "PREVIEW_ONLY";
-      last_decision_ = "reset";
-      message = "samples and result cleared";
-      return true;
+          std::lock_guard<std::mutex> lock(mutex_);
+          calibrator_->clear();
+          result_ = {};
+          capturing_ = false;
+          state_ = "PREVIEW_ONLY";
+          last_decision_ = "reset";
+          message = "samples and result cleared; capture stopped";
+          return true;
     });
     calibrate_service_ = createTriggerService("calibrate", [this](std::string & message) {
-      std::lock_guard<std::mutex> lock(mutex_);
-      if (calibrator_->sampleCount() < minimum_samples_) {
-        message = "not enough diverse samples";
-        return false;
-      }
-      try {
-        state_ = "CALIBRATING";
-        result_ = calibrator_->solve();
-        state_ = "CALIBRATED";
-        message = "calibration complete; RMS=" + formatDouble(result_.rms_error_px) + " px";
-        return true;
-      } catch (const std::exception & error) {
-        state_ = "CALIBRATION_FAILED";
-        message = error.what();
-        return false;
-      }
+          std::lock_guard<std::mutex> lock(mutex_);
+          if (calibrator_->sampleCount() < minimum_samples_) {
+            message = "not enough diverse samples";
+            return false;
+          }
+          try {
+            state_ = "CALIBRATING";
+            result_ = calibrator_->solve();
+            state_ = "CALIBRATED";
+            message = "calibration complete; RMS=" + formatDouble(result_.rms_error_px) +
+            " px, used=" + std::to_string(result_.sample_count) +
+            ", rejected=" + std::to_string(result_.rejected_sample_count);
+            return true;
+          } catch (const std::exception & error) {
+            state_ = "CALIBRATION_FAILED";
+            message = error.what();
+            return false;
+          }
     });
     save_service_ = createTriggerService("save", [this](std::string & message) {
-      std::lock_guard<std::mutex> lock(mutex_);
-      return saveResult(message);
+          std::lock_guard<std::mutex> lock(mutex_);
+          return saveResult(message);
     });
     commit_service_ = createTriggerService("commit", [this](std::string & message) {
-      return commitResult(message);
+          return commitResult(message);
     });
 
     RCLCPP_INFO(
@@ -219,8 +251,59 @@ private:
       return found;
     }
     const int flags = pattern_ == "acircles" ?
-      cv::CALIB_CB_ASYMMETRIC_GRID : cv::CALIB_CB_SYMMETRIC_GRID;
+      cv::CALIB_CB_ASYMMETRIC_GRID | cv::CALIB_CB_CLUSTERING :
+      cv::CALIB_CB_SYMMETRIC_GRID | cv::CALIB_CB_CLUSTERING;
     return cv::findCirclesGrid(gray, board_size, points, flags);
+  }
+
+  bool sampleQuality(
+    const cv::Mat & gray, const std::vector<cv::Point2f> & points,
+    std::string & reason) const
+  {
+    const cv::Rect bounds = cv::boundingRect(points) & cv::Rect(0, 0, gray.cols, gray.rows);
+    if (bounds.area() <= 0) {
+      reason = "invalid_board_bounds";
+      return false;
+    }
+    const double image_area = static_cast<double>(gray.total());
+    const double coverage = static_cast<double>(bounds.area()) / image_area;
+    if (coverage < minimum_board_coverage_) {
+      reason = "board_too_small";
+      return false;
+    }
+    const double edge_margin = std::min({
+        static_cast<double>(bounds.x) / gray.cols,
+        static_cast<double>(bounds.y) / gray.rows,
+        static_cast<double>(gray.cols - bounds.x - bounds.width) / gray.cols,
+        static_cast<double>(gray.rows - bounds.y - bounds.height) / gray.rows});
+    if (edge_margin < minimum_edge_margin_) {
+      reason = "board_too_close_to_edge";
+      return false;
+    }
+    const cv::Mat board_region = gray(bounds);
+    cv::Mat laplacian;
+    cv::Laplacian(board_region, laplacian, CV_64F);
+    cv::Scalar mean;
+    cv::Scalar standard_deviation;
+    cv::meanStdDev(laplacian, mean, standard_deviation);
+    const double sharpness = standard_deviation[0] * standard_deviation[0];
+    if (sharpness < minimum_sharpness_) {
+      reason = "board_too_blurry";
+      return false;
+    }
+    const double dark_ratio = static_cast<double>(cv::countNonZero(board_region < 10)) /
+      board_region.total();
+    const double bright_ratio = static_cast<double>(cv::countNonZero(board_region > 245)) /
+      board_region.total();
+    if (dark_ratio > maximum_dark_ratio_) {
+      reason = "board_too_dark";
+      return false;
+    }
+    if (bright_ratio > maximum_bright_ratio_) {
+      reason = "board_too_bright";
+      return false;
+    }
+    return true;
   }
 
   void processLatestImage()
@@ -247,6 +330,8 @@ private:
 
     std::vector<cv::Point2f> points;
     const bool found = detectBoard(gray, points);
+    std::string quality_reason;
+    const bool quality_ok = found && sampleQuality(gray, points, quality_reason);
     bool capturing = false;
     std::size_t sample_count = 0;
     {
@@ -256,6 +341,9 @@ private:
       if (!found) {
         state_ = capturing_ ? "WAITING_FOR_BOARD" : "PREVIEW_ONLY";
         last_decision_ = "board_not_found";
+      } else if (capturing_ && !quality_ok) {
+        state_ = "BOARD_DETECTED";
+        last_decision_ = quality_reason;
       } else if (capturing_) {
         const bool accepted = calibrator_->addSample(points, gray.size(), last_decision_);
         state_ = accepted ?
@@ -338,6 +426,14 @@ private:
     writeSequence(output, info.r.data(), info.r.size());
     output << "\nprojection_matrix:\n  rows: 3\n  cols: 4\n  data: ";
     writeSequence(output, info.p.data(), info.p.size());
+    output << "\ncalibration_metrics:\n  rms_px: " << result_.rms_error_px <<
+      "\n  mean_reprojection_error_px: " << result_.mean_reprojection_error_px <<
+      "\n  input_samples: " << result_.initial_sample_count <<
+      "\n  used_samples: " << result_.sample_count <<
+      "\n  rejected_samples: " << result_.rejected_sample_count <<
+      "\n  per_view_errors_px: ";
+    writeSequence(
+      output, result_.per_view_errors.data(), result_.per_view_errors.size());
     output << '\n';
     if (!output) {
       message = "failed while writing " + output_path_;
@@ -369,7 +465,7 @@ private:
         const auto response = future.get();
         std::lock_guard<std::mutex> lock(mutex_);
         last_decision_ = response->success ? "commit_succeeded" :
-          "commit_failed: " + response->status_message;
+        "commit_failed: " + response->status_message;
       });
     message = "set_camera_info request submitted";
     return true;
@@ -391,12 +487,22 @@ private:
       status.values.push_back(keyValue("state", state_));
       status.values.push_back(keyValue("last_decision", last_decision_));
       status.values.push_back(keyValue("received_frames", std::to_string(received_frames_.load())));
-      status.values.push_back(keyValue("processed_frames", std::to_string(processed_frames_.load())));
-      status.values.push_back(keyValue("accepted_samples", std::to_string(calibrator_->sampleCount())));
+      status.values.push_back(keyValue("processed_frames",
+          std::to_string(processed_frames_.load())));
+      status.values.push_back(keyValue("accepted_samples",
+          std::to_string(calibrator_->sampleCount())));
       status.values.push_back(keyValue("minimum_samples", std::to_string(minimum_samples_)));
       status.values.push_back(keyValue("capturing", capturing_ ? "true" : "false"));
       status.values.push_back(keyValue(
         "rms_error_px", result_.valid() ? formatDouble(result_.rms_error_px) : "n/a"));
+      status.values.push_back(keyValue(
+        "mean_reprojection_error_px",
+        result_.valid() ? formatDouble(result_.mean_reprojection_error_px) : "n/a"));
+      status.values.push_back(keyValue(
+        "used_samples", result_.valid() ? std::to_string(result_.sample_count) : "0"));
+      status.values.push_back(keyValue(
+        "rejected_samples",
+        result_.valid() ? std::to_string(result_.rejected_sample_count) : "0"));
     }
     array.status.push_back(std::move(status));
     status_publisher_->publish(std::move(array));
@@ -409,8 +515,13 @@ private:
   sensor_msgs::msg::Image::ConstSharedPtr last_processed_image_;
   std::atomic<std::uint64_t> received_frames_{0};
   std::atomic<std::uint64_t> processed_frames_{0};
-  std::size_t minimum_samples_{12};
-  bool capturing_{true};
+  std::size_t minimum_samples_{20};
+  bool capturing_{false};
+  double minimum_board_coverage_{0.01};
+  double minimum_edge_margin_{0.005};
+  double minimum_sharpness_{15.0};
+  double maximum_dark_ratio_{0.50};
+  double maximum_bright_ratio_{0.20};
   double preview_scale_{0.6};
   int jpeg_quality_{80};
   std::string pattern_;

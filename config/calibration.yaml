@@ -10,15 +10,26 @@
     board.rows: 7
     board.square_size_m: 0.03
 
-    sampling.auto_start: true
+    sampling.auto_start: false
     sampling.processing_rate_hz: 15.0
-    sampling.minimum_samples: 12
+    sampling.minimum_samples: 20
     sampling.maximum_samples: 40
-    sampling.minimum_sample_distance: 0.12
+    # RMS distance between all normalized grid points in two views.
+    sampling.minimum_sample_distance: 0.025
+    sampling.minimum_board_coverage: 0.01
+    sampling.minimum_edge_margin: 0.005
+    sampling.minimum_sharpness: 15.0
+    sampling.maximum_dark_ratio: 0.50
+    sampling.maximum_bright_ratio: 0.20
 
     calibration.fix_principal_point: false
     calibration.fix_aspect_ratio: false
     calibration.zero_tangent_distortion: false
+    calibration.fix_k3: true
+    calibration.outlier_minimum_error_px: 0.15
+    calibration.outlier_mad_scale: 3.0
+    calibration.minimum_pose_tilt_degrees: 10.0
+    calibration.minimum_tilted_samples_per_direction: 1
 
     display.preview_scale: 0.6
     display.jpeg_quality: 80
